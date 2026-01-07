@@ -1,589 +1,507 @@
 package main
 
 import (
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
-	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 )
 
-// Package represents a software package
-type Package struct {
-	Name         string            `json:"name"`
-	Version      string            `json:"version"`
-	Architecture string            `json:"arch"`
-	Description  string            `json:"description"`
-	Dependencies []string          `json:"dependencies"`
-	Conflicts    []string          `json:"conflicts"`
-	Size         int64             `json:"size"`
-	URL          string            `json:"url"`
-	Checksum     string            `json:"checksum"`
-	Signature    string            `json:"signature"`
-	Files        []string          `json:"files"`
-	Metadata     map[string]string `json:"metadata"`
-}
-
-// Repository represents a package repository
-type Repository struct {
-	Name     string `json:"name"`
-	URL      string `json:"url"`
-	Priority int    `json:"priority"`
-	Enabled  bool   `json:"enabled"`
-	Trusted  bool   `json:"trusted"`
-}
-
-// Transaction represents an installation/removal transaction
-type Transaction struct {
-	ID        int64
-	Type      string // install, remove, upgrade
-	Packages  string // JSON array of package names
-	Timestamp time.Time
-	Success   bool
-}
-
-// PackageManager is the main package manager structure
 type PackageManager struct {
 	db          *sql.DB
-	dbPath      string
-	rootDir     string
-	cacheDir    string
-	repos       []Repository
-	reposFile   string
-	lockFile    string
+	buildDir    string
+	installRoot string
 }
 
-// NewPackageManager creates a new package manager instance
-func NewPackageManager(rootDir string) (*PackageManager, error) {
-	pm := &PackageManager{
-		rootDir:   rootDir,
-		dbPath:    filepath.Join(rootDir, "var/lib/pkgmgr/packages.db"),
-		cacheDir:  filepath.Join(rootDir, "var/cache/pkgmgr"),
-		reposFile: filepath.Join(rootDir, "etc/pkgmgr/repositories.json"),
-		lockFile:  filepath.Join(rootDir, "var/lib/pkgmgr/lock"),
+type Package struct {
+	Name        string
+	Version     string
+	Release     string
+	Arch        string
+	Source      []string
+	Depends     []string
+	MakeDepends []string
+	PrepareCmd  string
+	BuildCmd    string
+	PackageCmd  string
+}
+
+func NewPackageManager(dbPath, buildDir, installRoot string) (*PackageManager, error) {
+	dbDir := filepath.Dir(dbPath)
+	if err := os.MkdirAll(dbDir, 0755); err != nil {
+		return nil, fmt.Errorf("DBディレクトリの作成に失敗: %v", err)
 	}
 
-	// Create necessary directories
-	dirs := []string{
-		filepath.Dir(pm.dbPath),
-		pm.cacheDir,
-		filepath.Dir(pm.reposFile),
-	}
-	for _, dir := range dirs {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return nil, fmt.Errorf("failed to create directory %s: %v", dir, err)
-		}
+	if err := os.MkdirAll(buildDir, 0755); err != nil {
+		return nil, fmt.Errorf("ビルドディレクトリの作成に失敗: %v", err)
 	}
 
-	// Initialize database
-	if err := pm.initDB(); err != nil {
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
 		return nil, err
 	}
 
-	// Load repositories
-	if err := pm.loadRepositories(); err != nil {
+	pm := &PackageManager{
+		db:          db,
+		buildDir:    buildDir,
+		installRoot: installRoot,
+	}
+
+	if err := pm.initDB(); err != nil {
 		return nil, err
 	}
 
 	return pm, nil
 }
 
-// initDB initializes the SQLite database
 func (pm *PackageManager) initDB() error {
-	db, err := sql.Open("sqlite3", pm.dbPath)
-	if err != nil {
-		return fmt.Errorf("failed to open database: %v", err)
-	}
-	pm.db = db
-
-	// Create tables
 	schema := `
-	CREATE TABLE IF NOT EXISTS installed_packages (
+	CREATE TABLE IF NOT EXISTS packages (
 		name TEXT PRIMARY KEY,
 		version TEXT NOT NULL,
-		architecture TEXT NOT NULL,
-		description TEXT,
-		dependencies TEXT,
-		conflicts TEXT,
-		size INTEGER,
-		install_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-		files TEXT
+		release TEXT NOT NULL,
+		arch TEXT NOT NULL,
+		installed INTEGER DEFAULT 0,
+		installed_at TIMESTAMP
 	);
-
-	CREATE TABLE IF NOT EXISTS available_packages (
-		name TEXT,
-		version TEXT,
-		repository TEXT,
-		architecture TEXT,
-		description TEXT,
-		dependencies TEXT,
-		conflicts TEXT,
-		size INTEGER,
-		url TEXT,
-		checksum TEXT,
-		signature TEXT,
-		PRIMARY KEY (name, version, repository)
-	);
-
-	CREATE TABLE IF NOT EXISTS transactions (
+	
+	CREATE TABLE IF NOT EXISTS sources (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		type TEXT NOT NULL,
-		packages TEXT NOT NULL,
-		timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-		success BOOLEAN
-	);
-
-	CREATE TABLE IF NOT EXISTS repositories (
-		name TEXT PRIMARY KEY,
+		package_name TEXT NOT NULL,
 		url TEXT NOT NULL,
-		priority INTEGER DEFAULT 0,
-		enabled BOOLEAN DEFAULT 1,
-		trusted BOOLEAN DEFAULT 0
+		FOREIGN KEY (package_name) REFERENCES packages(name)
 	);
-
-	CREATE INDEX IF NOT EXISTS idx_pkg_name ON available_packages(name);
-	CREATE INDEX IF NOT EXISTS idx_trans_time ON transactions(timestamp);
+	
+	CREATE TABLE IF NOT EXISTS dependencies (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		package_name TEXT NOT NULL,
+		depends_on TEXT NOT NULL,
+		FOREIGN KEY (package_name) REFERENCES packages(name)
+	);
 	`
-
-	_, err = pm.db.Exec(schema)
+	_, err := pm.db.Exec(schema)
 	return err
 }
 
-// loadRepositories loads repository configuration
-func (pm *PackageManager) loadRepositories() error {
-	data, err := os.ReadFile(pm.reposFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// Create default repositories file
-			pm.repos = []Repository{
-				{Name: "main", URL: "https://repo.example.com/main", Priority: 10, Enabled: true, Trusted: true},
-			}
-			return pm.saveRepositories()
-		}
-		return err
-	}
-
-	return json.Unmarshal(data, &pm.repos)
-}
-
-// saveRepositories saves repository configuration
-func (pm *PackageManager) saveRepositories() error {
-	data, err := json.MarshalIndent(pm.repos, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(pm.reposFile, data, 0644)
-}
-
-// AddRepository adds a new repository
-func (pm *PackageManager) AddRepository(name, url string, priority int, trusted bool) error {
-	for i, repo := range pm.repos {
-		if repo.Name == name {
-			pm.repos[i].URL = url
-			pm.repos[i].Priority = priority
-			pm.repos[i].Trusted = trusted
-			return pm.saveRepositories()
-		}
-	}
-
-	pm.repos = append(pm.repos, Repository{
-		Name:     name,
-		URL:      url,
-		Priority: priority,
-		Enabled:  true,
-		Trusted:  trusted,
-	})
-
-	return pm.saveRepositories()
-}
-
-// RemoveRepository removes a repository
-func (pm *PackageManager) RemoveRepository(name string) error {
-	for i, repo := range pm.repos {
-		if repo.Name == name {
-			pm.repos = append(pm.repos[:i], pm.repos[i+1:]...)
-			return pm.saveRepositories()
-		}
-	}
-	return fmt.Errorf("repository %s not found", name)
-}
-
-// UpdateRepositories updates package lists from all enabled repositories
-func (pm *PackageManager) UpdateRepositories() error {
-	fmt.Println("Updating package lists...")
-
-	for _, repo := range pm.repos {
-		if !repo.Enabled {
-			continue
-		}
-
-		fmt.Printf("Fetching %s...\n", repo.Name)
-
-		// Download repository index
-		resp, err := http.Get(repo.URL + "/packages.json")
-		if err != nil {
-			fmt.Printf("Warning: failed to fetch %s: %v\n", repo.Name, err)
-			continue
-		}
-		defer resp.Body.Close()
-
-		var packages []Package
-		if err := json.NewDecoder(resp.Body).Decode(&packages); err != nil {
-			fmt.Printf("Warning: failed to parse %s: %v\n", repo.Name, err)
-			continue
-		}
-
-		// Update database
-		tx, err := pm.db.Begin()
-		if err != nil {
-			return err
-		}
-
-		stmt, err := tx.Prepare(`
-			INSERT OR REPLACE INTO available_packages 
-			(name, version, repository, architecture, description, dependencies, conflicts, size, url, checksum, signature)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`)
-		if err != nil {
-			tx.Rollback()
-			return err
-		}
-
-		for _, pkg := range packages {
-			deps, _ := json.Marshal(pkg.Dependencies)
-			confs, _ := json.Marshal(pkg.Conflicts)
-
-			_, err := stmt.Exec(
-				pkg.Name, pkg.Version, repo.Name, pkg.Architecture,
-				pkg.Description, string(deps), string(confs),
-				pkg.Size, pkg.URL, pkg.Checksum, pkg.Signature,
-			)
-			if err != nil {
-				stmt.Close()
-				tx.Rollback()
-				return err
-			}
-		}
-
-		stmt.Close()
-		if err := tx.Commit(); err != nil {
-			return err
-		}
-
-		fmt.Printf("Updated %s: %d packages\n", repo.Name, len(packages))
-	}
-
-	return nil
-}
-
-// Search searches for packages matching the query
-func (pm *PackageManager) Search(query string) ([]Package, error) {
-	rows, err := pm.db.Query(`
-		SELECT DISTINCT name, version, repository, architecture, description, size
-		FROM available_packages
-		WHERE name LIKE ? OR description LIKE ?
-		ORDER BY name, version DESC
-	`, "%"+query+"%", "%"+query+"%")
+func (pm *PackageManager) ParsePKGBUILD(path string) (*Package, error) {
+	content, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	var packages []Package
-	for rows.Next() {
-		var pkg Package
-		var repo string
-		err := rows.Scan(&pkg.Name, &pkg.Version, &repo, &pkg.Architecture, &pkg.Description, &pkg.Size)
-		if err != nil {
-			return nil, err
-		}
-		packages = append(packages, pkg)
+	pkg := &Package{}
+	text := string(content)
+
+	// 基本変数の抽出
+	pkg.Name = extractSimpleVar(text, "pkgname")
+	pkg.Version = extractSimpleVar(text, "pkgver")
+	pkg.Release = extractSimpleVar(text, "pkgrel")
+	pkg.Arch = extractSimpleVar(text, "arch")
+
+	fmt.Printf("デバッグ: pkgname=%s, pkgver=%s, pkgrel=%s\n", pkg.Name, pkg.Version, pkg.Release)
+
+	// 配列の抽出
+	pkg.Source = extractArrayVar(text, "source")
+	pkg.Depends = extractArrayVar(text, "depends")
+	pkg.MakeDepends = extractArrayVar(text, "makedepends")
+
+	fmt.Printf("デバッグ: source数=%d, depends数=%d\n", len(pkg.Source), len(pkg.Depends))
+
+	// 関数の抽出
+	pkg.PrepareCmd = extractBashFunction(text, "prepare")
+	pkg.BuildCmd = extractBashFunction(text, "build")
+	pkg.PackageCmd = extractBashFunction(text, "package")
+
+	if pkg.PrepareCmd != "" {
+		fmt.Printf("デバッグ: prepare関数が見つかりました（%d文字）\n", len(pkg.PrepareCmd))
+	}
+	if pkg.BuildCmd != "" {
+		fmt.Printf("デバッグ: build関数が見つかりました（%d文字）\n", len(pkg.BuildCmd))
+	}
+	if pkg.PackageCmd != "" {
+		fmt.Printf("デバッグ: package関数が見つかりました（%d文字）\n", len(pkg.PackageCmd))
 	}
 
-	return packages, nil
+	if pkg.Name == "" {
+		return nil, fmt.Errorf("pkgnameが見つかりません")
+	}
+
+	return pkg, nil
 }
 
-// ResolveDependencies resolves package dependencies recursively
-func (pm *PackageManager) ResolveDependencies(pkgName string) ([]string, error) {
-	resolved := make(map[string]bool)
-	var resolve func(string) error
+func extractSimpleVar(content, varName string) string {
+	re := regexp.MustCompile(`(?m)^\s*` + varName + `=([^\n]+)`)
+	matches := re.FindStringSubmatch(content)
+	if len(matches) < 2 {
+		return ""
+	}
+	val := strings.TrimSpace(matches[1])
+	val = strings.Trim(val, `"'()`)
+	return val
+}
 
-	resolve = func(name string) error {
-		if resolved[name] {
-			return nil
-		}
+func extractArrayVar(content, varName string) []string {
+	result := []string{}
 
-		// Check if already installed
-		var installed int
-		err := pm.db.QueryRow("SELECT COUNT(*) FROM installed_packages WHERE name = ?", name).Scan(&installed)
-		if err != nil {
-			return err
-		}
-		if installed > 0 {
-			resolved[name] = true
-			return nil
-		}
-
-		// Get package info
-		var depsJSON string
-		err = pm.db.QueryRow(`
-			SELECT dependencies FROM available_packages 
-			WHERE name = ? 
-			ORDER BY version DESC LIMIT 1
-		`, name).Scan(&depsJSON)
-		if err != nil {
-			return fmt.Errorf("package %s not found", name)
-		}
-
-		resolved[name] = true
-
-		// Resolve dependencies
-		var deps []string
-		if depsJSON != "" {
-			json.Unmarshal([]byte(depsJSON), &deps)
-		}
-
-		for _, dep := range deps {
-			if err := resolve(dep); err != nil {
-				return err
+	// 単一行配列: var=(item1 item2)
+	re := regexp.MustCompile(`(?m)^\s*` + varName + `=\(([^)]+)\)`)
+	matches := re.FindStringSubmatch(content)
+	if len(matches) >= 2 {
+		items := strings.Fields(matches[1])
+		for _, item := range items {
+			item = strings.Trim(item, `"'`)
+			if item != "" && !strings.HasPrefix(item, "#") {
+				result = append(result, item)
 			}
 		}
-
-		return nil
+		return result
 	}
 
-	if err := resolve(pkgName); err != nil {
-		return nil, err
+	// 複数行配列
+	re = regexp.MustCompile(`(?s)^\s*` + varName + `=\(\s*\n(.*?)\n\s*\)`)
+	matches = re.FindStringSubmatch(content)
+	if len(matches) >= 2 {
+		lines := strings.Split(matches[1], "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			line = strings.Trim(line, `"'`)
+			result = append(result, line)
+		}
 	}
 
-	var result []string
-	for name := range resolved {
-		result = append(result, name)
-	}
-
-	return result, nil
+	return result
 }
 
-// CheckConflicts checks for package conflicts
-func (pm *PackageManager) CheckConflicts(packages []string) error {
-	conflicts := make(map[string][]string)
+func extractBashFunction(content, funcName string) string {
+	// パターン1: function_name() { ... }
+	re1 := regexp.MustCompile(`(?ms)^` + funcName + `\(\)\s*\{(.*?)^}`)
+	matches := re1.FindStringSubmatch(content)
+	if len(matches) >= 2 {
+		body := matches[1]
+		// 最初と最後の空行を削除
+		body = strings.TrimSpace(body)
+		fmt.Printf("デバッグ: %s()関数を抽出しました（パターン1、%d文字）\n", funcName, len(body))
+		return body
+	}
 
-	for _, pkg := range packages {
-		var conflictsJSON string
-		err := pm.db.QueryRow(`
-			SELECT conflicts FROM available_packages 
-			WHERE name = ? 
-			ORDER BY version DESC LIMIT 1
-		`, pkg).Scan(&conflictsJSON)
-		if err != nil {
+	// パターン2: function function_name { ... }
+	re2 := regexp.MustCompile(`(?ms)^function\s+` + funcName + `\s*\{(.*?)^}`)
+	matches = re2.FindStringSubmatch(content)
+	if len(matches) >= 2 {
+		body := matches[1]
+		body = strings.TrimSpace(body)
+		fmt.Printf("デバッグ: %s()関数を抽出しました（パターン2、%d文字）\n", funcName, len(body))
+		return body
+	}
+
+	// パターン3: より緩い検索（インデント対応）
+	lines := strings.Split(content, "\n")
+	inFunction := false
+	braceCount := 0
+	var functionBody []string
+	
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		
+		// 関数の開始を検出
+		if !inFunction && (trimmed == funcName+"() {" || strings.HasPrefix(trimmed, funcName+"()")) {
+			inFunction = true
+			braceCount = strings.Count(line, "{") - strings.Count(line, "}")
+			fmt.Printf("デバッグ: %s()関数の開始を検出（行%d）\n", funcName, i+1)
 			continue
 		}
-
-		var pkgConflicts []string
-		if conflictsJSON != "" {
-			json.Unmarshal([]byte(conflictsJSON), &pkgConflicts)
+		
+		if inFunction {
+			braceCount += strings.Count(line, "{") - strings.Count(line, "}")
+			
+			if braceCount == 0 && trimmed == "}" {
+				// 関数の終了
+				body := strings.Join(functionBody, "\n")
+				body = strings.TrimSpace(body)
+				fmt.Printf("デバッグ: %s()関数を抽出しました（パターン3、%d文字、%d行）\n", funcName, len(body), len(functionBody))
+				return body
+			}
+			
+			functionBody = append(functionBody, line)
 		}
+	}
+	
+	fmt.Printf("デバッグ: %s()関数が見つかりませんでした\n", funcName)
+	return ""
+}
 
-		for _, conflict := range pkgConflicts {
-			conflicts[pkg] = append(conflicts[pkg], conflict)
+func (pm *PackageManager) Install(pkgbuildPath string) error {
+	pkg, err := pm.ParsePKGBUILD(pkgbuildPath)
+	if err != nil {
+		return fmt.Errorf("PKGBUILDの解析に失敗: %v", err)
+	}
+
+	fmt.Printf("パッケージをインストール: %s-%s-%s\n", pkg.Name, pkg.Version, pkg.Release)
+	fmt.Printf("依存関係: %v\n", pkg.Depends)
+	fmt.Printf("ビルド依存: %v\n", pkg.MakeDepends)
+
+	// ビルドディレクトリ作成
+	pkgBuildDir := filepath.Join(pm.buildDir, pkg.Name)
+	os.RemoveAll(pkgBuildDir)
+	os.MkdirAll(pkgBuildDir, 0755)
+
+	// PKGBUILDをコピー
+	srcPkgbuild := pkgbuildPath
+	dstPkgbuild := filepath.Join(pkgBuildDir, "PKGBUILD")
+	if err := copyFile(srcPkgbuild, dstPkgbuild); err != nil {
+		return fmt.Errorf("PKGBUILDのコピーに失敗: %v", err)
+	}
+
+	// 追加ファイルをコピー（.patchや.desktopなど）
+	pkgbuildDir := filepath.Dir(pkgbuildPath)
+	extraFiles, _ := filepath.Glob(filepath.Join(pkgbuildDir, "*"))
+	for _, f := range extraFiles {
+		if f != pkgbuildPath {
+			base := filepath.Base(f)
+			copyFile(f, filepath.Join(pkgBuildDir, base))
 		}
 	}
 
-	// Check if any conflicts exist in the install list or installed packages
-	for pkg, conflictList := range conflicts {
-		for _, conflict := range conflictList {
-			// Check in install list
-			for _, installPkg := range packages {
-				if installPkg == conflict {
-					return fmt.Errorf("conflict: %s conflicts with %s", pkg, conflict)
-				}
+	// ソースダウンロード
+	fmt.Println("\n==> ソースを取得中...")
+	for _, src := range pkg.Source {
+		// URLでない場合はスキップ（ローカルファイルとして扱う）
+		if !strings.HasPrefix(src, "http://") && !strings.HasPrefix(src, "https://") {
+			continue
+		}
+		
+		// {,.asc} のような表記を展開
+		if strings.Contains(src, "{") {
+			baseSrc := strings.Split(src, "{")[0]
+			if err := pm.downloadSource(baseSrc, pkgBuildDir); err != nil {
+				fmt.Printf("警告: %sのダウンロードに失敗: %v\n", baseSrc, err)
 			}
-
-			// Check in installed packages
-			var installed int
-			pm.db.QueryRow("SELECT COUNT(*) FROM installed_packages WHERE name = ?", conflict).Scan(&installed)
-			if installed > 0 {
-				return fmt.Errorf("conflict: %s conflicts with installed package %s", pkg, conflict)
+		} else {
+			if err := pm.downloadSource(src, pkgBuildDir); err != nil {
+				fmt.Printf("警告: %sのダウンロードに失敗: %v\n", src, err)
 			}
 		}
 	}
 
+	// prepare実行
+	if pkg.PrepareCmd != "" {
+		fmt.Println("\n==> prepare()を実行中...")
+		if err := pm.runPhase("prepare", pkg.PrepareCmd, pkgBuildDir, pkg); err != nil {
+			return fmt.Errorf("prepareに失敗: %v", err)
+		}
+	} else {
+		fmt.Println("\n==> prepare()関数なし、スキップ")
+	}
+
+	// build実行
+	if pkg.BuildCmd != "" {
+		fmt.Println("\n==> build()を実行中...")
+		if err := pm.runPhase("build", pkg.BuildCmd, pkgBuildDir, pkg); err != nil {
+			return fmt.Errorf("buildに失敗: %v", err)
+		}
+	} else {
+		fmt.Println("\n==> build()関数なし、スキップ")
+	}
+
+	// package実行
+	if pkg.PackageCmd != "" {
+		fmt.Println("\n==> package()を実行中...")
+		if err := pm.runPhase("package", pkg.PackageCmd, pkgBuildDir, pkg); err != nil {
+			return fmt.Errorf("packageに失敗: %v", err)
+		}
+	} else {
+		fmt.Println("\n==> package()関数なし、スキップ")
+	}
+
+	// pkgdirの内容をインストール
+	pkgDir := filepath.Join(pkgBuildDir, "pkg")
+	if _, err := os.Stat(pkgDir); err == nil {
+		fmt.Println("\n==> ファイルをインストール中...")
+		if err := pm.installFiles(pkgDir); err != nil {
+			return fmt.Errorf("ファイルのインストールに失敗: %v", err)
+		}
+	}
+
+	// DBに登録
+	if err := pm.registerPackage(pkg); err != nil {
+		return fmt.Errorf("パッケージの登録に失敗: %v", err)
+	}
+
+	fmt.Printf("\n==> パッケージ %s のインストールが完了しました\n", pkg.Name)
 	return nil
 }
 
-// Install installs a package and its dependencies
-func (pm *PackageManager) Install(pkgName string) error {
-	fmt.Printf("Resolving dependencies for %s...\n", pkgName)
+func (pm *PackageManager) runPhase(phase, cmd, workDir string, pkg *Package) error {
+	srcDir := filepath.Join(workDir, "src")
+	pkgDir := filepath.Join(workDir, "pkg")
+	os.MkdirAll(srcDir, 0755)
+	os.MkdirAll(pkgDir, 0755)
 
-	// Resolve dependencies
-	packages, err := pm.ResolveDependencies(pkgName)
-	if err != nil {
-		return err
-	}
-
-	// Check conflicts
-	if err := pm.CheckConflicts(packages); err != nil {
-		return err
-	}
-
-	fmt.Printf("Packages to install: %s\n", strings.Join(packages, ", "))
-
-	// Start transaction
-	txID, err := pm.beginTransaction("install", packages)
-	if err != nil {
-		return err
-	}
-
-	success := true
-	for _, pkg := range packages {
-		if err := pm.installPackage(pkg); err != nil {
-			fmt.Printf("Error installing %s: %v\n", pkg, err)
-			success = false
-			break
-		}
-	}
-
-	pm.endTransaction(txID, success)
-
-	if !success {
-		return fmt.Errorf("installation failed")
-	}
-
-	fmt.Println("Installation completed successfully")
-	return nil
-}
-
-// installPackage installs a single package
-func (pm *PackageManager) installPackage(pkgName string) error {
-	// Get package info
-	var pkg Package
-	var depsJSON, conflictsJSON, filesJSON string
-	err := pm.db.QueryRow(`
-		SELECT name, version, architecture, description, dependencies, conflicts, size, url, checksum
-		FROM available_packages 
-		WHERE name = ? 
-		ORDER BY version DESC LIMIT 1
-	`, pkgName).Scan(
-		&pkg.Name, &pkg.Version, &pkg.Architecture, &pkg.Description,
-		&depsJSON, &conflictsJSON, &pkg.Size, &pkg.URL, &pkg.Checksum,
+	// makepkgの環境変数を設定
+	env := os.Environ()
+	env = append(env,
+		fmt.Sprintf("srcdir=%s", srcDir),
+		fmt.Sprintf("pkgdir=%s", pkgDir),
+		fmt.Sprintf("pkgname=%s", pkg.Name),
+		fmt.Sprintf("pkgver=%s", pkg.Version),
+		fmt.Sprintf("pkgrel=%s", pkg.Release),
 	)
+
+	// PKGBUILDをsourceしてから関数を実行
+	script := fmt.Sprintf(`
+set -e
+cd "%s"
+source PKGBUILD
+%s() {
+%s
+}
+echo "==> %s()を実行します..."
+%s
+`, workDir, phase, cmd, phase, phase)
+
+	fmt.Printf("デバッグ: 実行するスクリプト:\n%s\n", script)
+
+	cmdExec := exec.Command("bash", "-c", script)
+	cmdExec.Env = env
+	cmdExec.Stdout = os.Stdout
+	cmdExec.Stderr = os.Stderr
+
+	return cmdExec.Run()
+}
+
+func (pm *PackageManager) downloadSource(url, destDir string) error {
+	fmt.Printf("  -> ダウンロード中: %s\n", url)
+
+	resp, err := http.Get(url)
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
 
-	fmt.Printf("Installing %s %s...\n", pkg.Name, pkg.Version)
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
 
-	// Download package (simulated)
-	// In real implementation, download from pkg.URL and verify checksum
+	filename := filepath.Base(url)
+	if idx := strings.Index(filename, "?"); idx > 0 {
+		filename = filename[:idx]
+	}
 
-	// Record installation
-	_, err = pm.db.Exec(`
-		INSERT OR REPLACE INTO installed_packages 
-		(name, version, architecture, description, dependencies, conflicts, size, files)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, pkg.Name, pkg.Version, pkg.Architecture, pkg.Description,
-		depsJSON, conflictsJSON, pkg.Size, filesJSON)
+	destPath := filepath.Join(destDir, filename)
 
+	out, err := os.Create(destPath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, resp.Body)
 	return err
 }
 
-// Remove removes a package
-func (pm *PackageManager) Remove(pkgName string) error {
-	// Check if package is installed
+func (pm *PackageManager) installFiles(pkgDir string) error {
+	return filepath.Walk(pkgDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		relPath, _ := filepath.Rel(pkgDir, path)
+		if relPath == "." {
+			return nil
+		}
+
+		destPath := filepath.Join(pm.installRoot, relPath)
+
+		if info.IsDir() {
+			return os.MkdirAll(destPath, info.Mode())
+		}
+
+		return copyFile(path, destPath)
+	})
+}
+
+func copyFile(src, dst string) error {
+	os.MkdirAll(filepath.Dir(dst), 0755)
+
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	if _, err := io.Copy(dstFile, srcFile); err != nil {
+		return err
+	}
+
+	srcInfo, _ := srcFile.Stat()
+	return os.Chmod(dst, srcInfo.Mode())
+}
+
+func (pm *PackageManager) registerPackage(pkg *Package) error {
+	tx, err := pm.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(`
+		INSERT OR REPLACE INTO packages (name, version, release, arch, installed, installed_at)
+		VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+	`, pkg.Name, pkg.Version, pkg.Release, pkg.Arch)
+	if err != nil {
+		return err
+	}
+
+	for _, src := range pkg.Source {
+		_, err = tx.Exec(`
+			INSERT INTO sources (package_name, url) VALUES (?, ?)
+		`, pkg.Name, src)
+		if err != nil {
+			return err
+		}
+	}
+
+	for _, dep := range pkg.Depends {
+		_, err = tx.Exec(`
+			INSERT INTO dependencies (package_name, depends_on) VALUES (?, ?)
+		`, pkg.Name, dep)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+func (pm *PackageManager) isInstalled(pkgName string) bool {
 	var installed int
-	err := pm.db.QueryRow("SELECT COUNT(*) FROM installed_packages WHERE name = ?", pkgName).Scan(&installed)
-	if err != nil {
-		return err
-	}
-	if installed == 0 {
-		return fmt.Errorf("package %s is not installed", pkgName)
-	}
-
-	// Check if other packages depend on this
-	rows, err := pm.db.Query(`
-		SELECT name FROM installed_packages 
-		WHERE dependencies LIKE ?
-	`, "%"+pkgName+"%")
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	var dependents []string
-	for rows.Next() {
-		var dep string
-		rows.Scan(&dep)
-		dependents = append(dependents, dep)
-	}
-
-	if len(dependents) > 0 {
-		return fmt.Errorf("cannot remove %s: required by %s", pkgName, strings.Join(dependents, ", "))
-	}
-
-	fmt.Printf("Removing %s...\n", pkgName)
-
-	// Start transaction
-	txID, err := pm.beginTransaction("remove", []string{pkgName})
-	if err != nil {
-		return err
-	}
-
-	// Remove from database
-	_, err = pm.db.Exec("DELETE FROM installed_packages WHERE name = ?", pkgName)
-
-	pm.endTransaction(txID, err == nil)
-
-	if err != nil {
-		return err
-	}
-
-	fmt.Println("Package removed successfully")
-	return nil
+	err := pm.db.QueryRow(`
+		SELECT installed FROM packages WHERE name = ?
+	`, pkgName).Scan(&installed)
+	return err == nil && installed == 1
 }
 
-// Upgrade upgrades an installed package
-func (pm *PackageManager) Upgrade(pkgName string) error {
-	// Check current version
-	var currentVersion string
-	err := pm.db.QueryRow("SELECT version FROM installed_packages WHERE name = ?", pkgName).Scan(&currentVersion)
-	if err != nil {
-		return fmt.Errorf("package %s is not installed", pkgName)
-	}
-
-	// Check available version
-	var availableVersion string
-	err = pm.db.QueryRow(`
-		SELECT version FROM available_packages 
-		WHERE name = ? 
-		ORDER BY version DESC LIMIT 1
-	`, pkgName).Scan(&availableVersion)
-	if err != nil {
-		return fmt.Errorf("no updates available for %s", pkgName)
-	}
-
-	if currentVersion >= availableVersion {
-		fmt.Printf("%s is already at the latest version (%s)\n", pkgName, currentVersion)
-		return nil
-	}
-
-	fmt.Printf("Upgrading %s from %s to %s...\n", pkgName, currentVersion, availableVersion)
-
-	return pm.installPackage(pkgName)
-}
-
-// ListInstalled lists all installed packages
 func (pm *PackageManager) ListInstalled() error {
 	rows, err := pm.db.Query(`
-		SELECT name, version, size, install_date 
-		FROM installed_packages 
+		SELECT name, version, release, installed_at 
+		FROM packages 
+		WHERE installed = 1
 		ORDER BY name
 	`)
 	if err != nil {
@@ -591,276 +509,126 @@ func (pm *PackageManager) ListInstalled() error {
 	}
 	defer rows.Close()
 
-	fmt.Println("Installed packages:")
-	fmt.Println("-------------------")
+	fmt.Println("インストール済みパッケージ:")
+	fmt.Println("----------------------------------------")
+	count := 0
 	for rows.Next() {
-		var name, version, installDate string
-		var size int64
-		rows.Scan(&name, &version, &size, &installDate)
-		fmt.Printf("%-30s %-15s %10d KB  %s\n", name, version, size/1024, installDate[:10])
-	}
-
-	return nil
-}
-
-// ShowHistory shows transaction history
-func (pm *PackageManager) ShowHistory(limit int) error {
-	rows, err := pm.db.Query(`
-		SELECT id, type, packages, timestamp, success 
-		FROM transactions 
-		ORDER BY timestamp DESC 
-		LIMIT ?
-	`, limit)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	fmt.Println("Transaction history:")
-	fmt.Println("--------------------")
-	for rows.Next() {
-		var tx Transaction
-		var packagesJSON string
-		rows.Scan(&tx.ID, &tx.Type, &packagesJSON, &tx.Timestamp, &tx.Success)
-
-		status := "SUCCESS"
-		if !tx.Success {
-			status = "FAILED"
-		}
-
-		fmt.Printf("[%d] %s - %s - %s - %s\n",
-			tx.ID, tx.Timestamp.Format("2006-01-02 15:04:05"),
-			tx.Type, packagesJSON, status)
-	}
-
-	return nil
-}
-
-// Rollback rolls back to a previous transaction
-func (pm *PackageManager) Rollback(txID int64) error {
-	var txType, packagesJSON string
-	err := pm.db.QueryRow(`
-		SELECT type, packages FROM transactions WHERE id = ?
-	`, txID).Scan(&txType, &packagesJSON)
-	if err != nil {
-		return fmt.Errorf("transaction %d not found", txID)
-	}
-
-	var packages []string
-	json.Unmarshal([]byte(packagesJSON), &packages)
-
-	fmt.Printf("Rolling back transaction %d (%s)...\n", txID, txType)
-
-	// Reverse the operation
-	switch txType {
-	case "install":
-		for _, pkg := range packages {
-			pm.Remove(pkg)
-		}
-	case "remove":
-		for _, pkg := range packages {
-			pm.Install(pkg)
-		}
-	}
-
-	return nil
-}
-
-// Clean removes cached package files
-func (pm *PackageManager) Clean() error {
-	fmt.Println("Cleaning package cache...")
-
-	err := filepath.Walk(pm.cacheDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
+		var name, version, release, installedAt string
+		if err := rows.Scan(&name, &version, &release, &installedAt); err != nil {
 			return err
 		}
-		if !info.IsDir() {
-			os.Remove(path)
-		}
+		fmt.Printf("%s %s-%s (インストール日時: %s)\n", name, version, release, installedAt)
+		count++
+	}
+
+	if count == 0 {
+		fmt.Println("(なし)")
+	}
+
+	return rows.Err()
+}
+
+func (pm *PackageManager) Info(pkgName string) error {
+	var name, version, release, arch, installedAt string
+	err := pm.db.QueryRow(`
+		SELECT name, version, release, arch, installed_at 
+		FROM packages 
+		WHERE name = ?
+	`, pkgName).Scan(&name, &version, &release, &arch, &installedAt)
+
+	if err == sql.ErrNoRows {
+		fmt.Printf("パッケージ %s はインストールされていません\n", pkgName)
 		return nil
-	})
-
+	}
 	if err != nil {
 		return err
 	}
 
-	fmt.Println("Cache cleaned")
-	return nil
-}
+	fmt.Printf("パッケージ名: %s\n", name)
+	fmt.Printf("バージョン: %s-%s\n", version, release)
+	fmt.Printf("アーキテクチャ: %s\n", arch)
+	fmt.Printf("インストール日時: %s\n", installedAt)
 
-// beginTransaction starts a new transaction record
-func (pm *PackageManager) beginTransaction(txType string, packages []string) (int64, error) {
-	packagesJSON, _ := json.Marshal(packages)
-	result, err := pm.db.Exec(`
-		INSERT INTO transactions (type, packages, success) 
-		VALUES (?, ?, 0)
-	`, txType, string(packagesJSON))
-	if err != nil {
-		return 0, err
-	}
-	return result.LastInsertId()
-}
-
-// endTransaction marks a transaction as complete
-func (pm *PackageManager) endTransaction(txID int64, success bool) {
-	pm.db.Exec("UPDATE transactions SET success = ? WHERE id = ?", success, txID)
-}
-
-// VerifyChecksum verifies a file's checksum
-func (pm *PackageManager) VerifyChecksum(filePath, expectedChecksum string) error {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return err
-	}
-
-	actualChecksum := hex.EncodeToString(h.Sum(nil))
-	if actualChecksum != expectedChecksum {
-		return fmt.Errorf("checksum mismatch: expected %s, got %s", expectedChecksum, actualChecksum)
+	// 依存関係
+	rows, err := pm.db.Query(`
+		SELECT depends_on FROM dependencies WHERE package_name = ?
+	`, pkgName)
+	if err == nil {
+		defer rows.Close()
+		fmt.Print("依存関係: ")
+		deps := []string{}
+		for rows.Next() {
+			var dep string
+			rows.Scan(&dep)
+			deps = append(deps, dep)
+		}
+		if len(deps) > 0 {
+			fmt.Println(strings.Join(deps, ", "))
+		} else {
+			fmt.Println("(なし)")
+		}
 	}
 
 	return nil
 }
 
-// Close closes the package manager and database connection
 func (pm *PackageManager) Close() error {
-	if pm.db != nil {
-		return pm.db.Close()
-	}
-	return nil
+	return pm.db.Close()
 }
 
 func main() {
 	if len(os.Args) < 2 {
-		printUsage()
+		fmt.Println("使用方法:")
+		fmt.Println("  install <PKGBUILD_PATH> - パッケージをインストール")
+		fmt.Println("  list                    - インストール済みパッケージを表示")
+		fmt.Println("  info <PKG_NAME>         - パッケージ情報を表示")
 		os.Exit(1)
 	}
 
-	pm, err := NewPackageManager("/")
+	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "ホームディレクトリの取得エラー: %v\n", err)
+		os.Exit(1)
+	}
+
+	pm, err := NewPackageManager(
+		filepath.Join(homeDir, ".local/share/gopkg/packages.db"),
+		filepath.Join(homeDir, ".cache/gopkg-build"),
+		filepath.Join(homeDir, ".local"),
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "初期化エラー: %v\n", err)
 		os.Exit(1)
 	}
 	defer pm.Close()
 
-	command := os.Args[1]
-
-	switch command {
-	case "install", "i":
+	cmd := os.Args[1]
+	switch cmd {
+	case "install":
 		if len(os.Args) < 3 {
-			fmt.Println("Usage: pkgmgr install <package>")
+			fmt.Fprintln(os.Stderr, "エラー: PKGBUILDのパスを指定してください")
 			os.Exit(1)
 		}
-		err = pm.Install(os.Args[2])
-
-	case "remove", "r":
-		if len(os.Args) < 3 {
-			fmt.Println("Usage: pkgmgr remove <package>")
+		if err := pm.Install(os.Args[2]); err != nil {
+			fmt.Fprintf(os.Stderr, "エラー: %v\n", err)
 			os.Exit(1)
 		}
-		err = pm.Remove(os.Args[2])
-
-	case "upgrade", "u":
-		if len(os.Args) < 3 {
-			fmt.Println("Usage: pkgmgr upgrade <package>")
-			os.Exit(1)
-		}
-		err = pm.Upgrade(os.Args[2])
-
-	case "update":
-		err = pm.UpdateRepositories()
-
-	case "search", "s":
-		if len(os.Args) < 3 {
-			fmt.Println("Usage: pkgmgr search <query>")
-			os.Exit(1)
-		}
-		packages, err := pm.Search(os.Args[2])
-		if err == nil {
-			for _, pkg := range packages {
-				fmt.Printf("%-30s %-15s %s\n", pkg.Name, pkg.Version, pkg.Description)
-			}
-		}
-
 	case "list":
-		err = pm.ListInstalled()
-
-	case "history":
-		limit := 20
-		err = pm.ShowHistory(limit)
-
-	case "rollback":
+		if err := pm.ListInstalled(); err != nil {
+			fmt.Fprintf(os.Stderr, "エラー: %v\n", err)
+			os.Exit(1)
+		}
+	case "info":
 		if len(os.Args) < 3 {
-			fmt.Println("Usage: pkgmgr rollback <transaction_id>")
+			fmt.Fprintln(os.Stderr, "エラー: パッケージ名を指定してください")
 			os.Exit(1)
 		}
-		var txID int64
-		fmt.Sscanf(os.Args[2], "%d", &txID)
-		err = pm.Rollback(txID)
-
-	case "clean":
-		err = pm.Clean()
-
-	case "repo-add":
-		if len(os.Args) < 4 {
-			fmt.Println("Usage: pkgmgr repo-add <name> <url> [priority] [trusted]")
+		if err := pm.Info(os.Args[2]); err != nil {
+			fmt.Fprintf(os.Stderr, "エラー: %v\n", err)
 			os.Exit(1)
 		}
-		priority := 0
-		trusted := false
-		if len(os.Args) > 4 {
-			fmt.Sscanf(os.Args[4], "%d", &priority)
-		}
-		if len(os.Args) > 5 {
-			trusted = os.Args[5] == "true"
-		}
-		err = pm.AddRepository(os.Args[2], os.Args[3], priority, trusted)
-
-	case "repo-remove":
-		if len(os.Args) < 3 {
-			fmt.Println("Usage: pkgmgr repo-remove <name>")
-			os.Exit(1)
-		}
-		err = pm.RemoveRepository(os.Args[2])
-
 	default:
-		printUsage()
+		fmt.Fprintf(os.Stderr, "不明なコマンド: %s\n", cmd)
 		os.Exit(1)
 	}
-
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-}
-
-func printUsage() {
-	fmt.Println(`Package Manager - A modern package management system
-
-Usage:
-  pkgmgr <command> [arguments]
-
-Commands:
-  install, i <package>           Install a package and its dependencies
-  remove, r <package>            Remove a package
-  upgrade, u <package>           Upgrade a package to the latest version
-  update                         Update repository package lists
-  search, s <query>              Search for packages
-  list                           List installed packages
-  history                        Show transaction history
-  rollback <transaction_id>      Rollback to a previous transaction
-  clean                          Clean package cache
-  repo-add <name> <url>          Add a new repository
-  repo-remove <name>             Remove a repository
-
-Examples:
-  pkgmgr install nginx
-  pkgmgr search http
-  pkgmgr update
-  pkgmgr list`)
 }
